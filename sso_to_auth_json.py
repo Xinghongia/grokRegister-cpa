@@ -960,6 +960,10 @@ def discover_sso_files(scan_dir: str | Path = ".") -> list[Path]:
         for path in sorted(root.glob(pattern)):
             if path.is_file():
                 found[path] = None
+        # 兼容账号文件存放于 accounts/ 子目录
+        for path in sorted(root.glob(f"accounts/{pattern}")):
+            if path.is_file():
+                found[path] = None
     return list(found)
 
 

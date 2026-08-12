@@ -29,8 +29,9 @@ from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
-# SSO → CLIProxyAPI(CPA) 扁平格式转换（复用 sso_to_auth_json 的授权码流程 + 写入器）
+# SSO → CLIProxyAPI(CPA) 扁平格式转换与 OAuth 流程
 import sso_to_auth_json as _s2cpa
+import cpa_oauth as _cpa_oauth
 from email_providers import cloudflare as cloudflare_provider
 from email_providers import cloudmail as cloudmail_provider
 from email_providers import duckmail as duckmail_provider
@@ -83,6 +84,13 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 NSFW_PENDING_FILE = os.path.join(APP_DIR, "nsfw_pending.txt")
 NSFW_CANCEL_TIMEOUT = 15.0
 MEMORY_CLEANUP_INTERVAL = 5
+ACCOUNTS_DIR = os.path.join(APP_DIR, "accounts")
+
+
+def ensure_accounts_dir() -> str:
+    """确保账号输出目录存在并返回其绝对路径。"""
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    return ACCOUNTS_DIR
 
 _session_log_path = None
 _session_log_lock = threading.Lock()
@@ -165,6 +173,10 @@ DEFAULT_CONFIG = {
     "cpa_management_key": "",
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
+    # grok2api 后台同步：登录用管理员凭据，建议在 config.json 中填写
+    "grok2api_url": "",
+    "grok2api_admin_user": "admin",
+    "grok2api_admin_password": "",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
     # 协议 HTTP 注册（对齐 grok-register-new）：默认开启，避免浏览器 UI 打 bot 标
@@ -522,6 +534,7 @@ def run_protocol_pipeline_batch(
         log_callback("[*] 注册模式: protocol pipeline（S/P/C/O）")
 
     def _on_sso(email, password, sso, profile):
+        add_sso_to_grok2api(sso, email=email, log_callback=log_callback)
         if on_account:
             on_account(email, password, sso, profile or {})
         else:
@@ -590,8 +603,92 @@ def register_account_once(log_callback=None, cancel_callback=None):
     return email, profile.get("password", ""), sso, profile
 
 
+def add_sso_to_grok2api(raw_token, email="", log_callback=None) -> bool:
+    """自动将注册成功获取到的 SSO 凭据无缝推送到 grok2api 后台 (Web 账号池)。"""
+    import urllib.request
+    import urllib.parse
+
+    grok2api_url = str(config.get("grok2api_url", "") or "").strip().rstrip("/")
+    if not grok2api_url:
+        return True
+    admin_user = str(config.get("grok2api_admin_user", "admin") or "admin").strip()
+    admin_password = str(config.get("grok2api_admin_password", "") or "").strip()
+    if not admin_password:
+        if log_callback:
+            log_callback("[grok2api] 未配置 grok2api_admin_password，跳过同步")
+        return False
+
+    sso = _normalize_sso_token(raw_token)
+    if not sso:
+        return False
+
+    def _g2a_log(msg):
+        if log_callback:
+            log_callback(f"[grok2api] {str(msg).strip()}")
+
+    try:
+        # 1. 登录 grok2api 获取 admin token
+        login_url = f"{grok2api_url}/api/admin/v1/auth/login"
+        login_req = urllib.request.Request(
+            login_url,
+            data=json.dumps({"username": admin_user, "password": admin_password}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(login_req, timeout=10) as resp:
+            if resp.status != 200:
+                _g2a_log(f"⚠️ 登录 grok2api 失败 HTTP {resp.status}")
+                return False
+            login_data = json.loads(resp.read().decode("utf-8"))
+
+        tokens = (login_data.get("data") or {}).get("tokens") or {}
+        admin_token = tokens.get("accessToken") or login_data.get("accessToken")
+        if not admin_token:
+            _g2a_log("⚠️ 解析 grok2api admin token 失败")
+            return False
+
+        # 2. 提交 multipart 文件导入请求
+        url = f"{grok2api_url}/api/admin/v1/accounts/web/import"
+        item = {
+            "sso_token": sso,
+            "token": sso,
+            "sso": sso,
+            "email": email or ""
+        }
+        json_content = json.dumps([item], ensure_ascii=False).encode("utf-8")
+
+        boundary = "----WebKitFormBoundary" + secrets.token_hex(16)
+        body = []
+        body.append(f"--{boundary}".encode("utf-8"))
+        body.append(b'Content-Disposition: form-data; name="file"; filename="sso_import.json"')
+        body.append(b'Content-Type: application/json\r\n')
+        body.append(json_content)
+        body.append(f"--{boundary}--\r\n".encode("utf-8"))
+        payload = b"\r\n".join(body)
+
+        import_req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(import_req, timeout=15) as resp:
+            if resp.status == 200:
+                _g2a_log(f"✅ 账号 {email or ''} 成功同步导入到 grok2api (Web 池)！")
+                return True
+            else:
+                _g2a_log(f"⚠️ 同步导入到 grok2api 失败 HTTP {resp.status}")
+                return False
+    except Exception as exc:
+        _g2a_log(f"⚠️ grok2api 同步请求异常: {exc}")
+        return False
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
-    """SSO → 授权码流程换 token → 写入本地 CPA auth 目录和/或远程 CPA。
+    """SSO → 通过 CPA 官方 OAuth 流程（xai-auth-url + 浏览器授权）入库 CPA。
 
     返回 True 表示 CPA 入库成功（或未开启/无需转换）；False 表示转换失败（SSO 仍可能已写入 accounts）。
     """
@@ -599,23 +696,17 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
         if log_callback:
             log_callback("[*] 已关闭 SSO→CPA auth，仅保存 SSO（不写 auth）")
         return True
-    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
+
     remote_url = str(config.get("cpa_remote_url", "") or "").strip()
     management_key = str(config.get("cpa_management_key", "") or "").strip()
-    if not auth_dir and not remote_url:
+    if not remote_url or not management_key:
         if log_callback:
-            log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_auth_dir 或 cpa_remote_url，跳过")
+            log_callback("[Debug] 已开启 CPA 直出但未配置 cpa_remote_url 或 cpa_management_key，跳过 CPA OAuth 入库")
         return True
-    if remote_url and not management_key:
-        if log_callback:
-            log_callback("[Debug] 已配置 cpa_remote_url 但未配置 cpa_management_key，跳过远程上传")
-        remote_url = ""
-    if not auth_dir and not remote_url:
-        return True
+
     sso = _normalize_sso_token(raw_token)
     if not sso:
         return False
-    proxy = _resolve_cpa_proxy()
 
     def _cpa_log(message):
         if log_callback:
@@ -623,75 +714,33 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> 
 
     try:
         if should_stop and should_stop():
-            _cpa_log("用户停止，跳过授权转换")
+            _cpa_log("用户停止，跳过 CPA OAuth 入库")
             return False
-        _cpa_log(f"SSO → Device Flow 换 token (proxy={proxy}) ...")
-        token = _s2cpa.sso_to_token(
-            sso,
-            proxy=proxy,
+
+        _cpa_log("发起 CPA 官方 OAuth 流程（xai-auth-url + 浏览器授权）...")
+        ok = _cpa_oauth.process_cpa_oauth_flow(
+            sso_cookie=sso,
+            cpa_url=remote_url,
+            management_key=management_key,
+            email=email,
             log=_cpa_log,
             should_stop=should_stop,
         )
-        if not token:
+
+        if not ok:
             if should_stop and should_stop():
                 _cpa_log("用户停止，SSO 已保存在 accounts 文件")
                 return False
-            _cpa_log("Device Flow 换 token 失败；SSO 已在 accounts 文件，稍后可重转")
+            _cpa_log("CPA OAuth 授权入库失败；SSO 已在 accounts 文件，稍后可重试")
             _append_sso_pending(email, sso, log_callback=log_callback)
             return False
-        if should_stop and should_stop():
-            _cpa_log("用户停止，跳过 auth 写入")
-            return False
-        record = _s2cpa.token_to_cpa_record(token, email=email, sso=sso)
-        ap = _s2cpa.decode_jwt_payload(record.get("access_token", ""))
-        ref = ap.get("referrer")
-        bot = ap.get("bot_flag_source")
-        scope = ap.get("scope")
-        if ref:
-            _cpa_log(f"警告: access_token 仍带 referrer={ref!r}（健康号应为空）")
-        else:
-            _cpa_log("access_token 无 referrer（健康样式）")
-        if bot is not None:
-            _cpa_log(f"警告: bot_flag_source={bot!r}")
-        _cpa_log(f"scope={scope!r}")
-        wrote_ok = False
-        if auth_dir:
-            try:
-                path = _s2cpa.write_cpa_auth(_s2cpa.Path(auth_dir), record)
-                _cpa_log(f"已写入本地 {path}")
-                wrote_ok = True
-            except Exception as local_exc:
-                _cpa_log(f"本地写入失败: {local_exc}")
-        if remote_url:
-            if should_stop and should_stop():
-                _cpa_log("用户停止，跳过远程上传")
-                return wrote_ok
-            try:
-                name = _s2cpa.upload_cpa_auth_remote(remote_url, management_key, record)
-                _cpa_log(f"已上传远程 {remote_url.rstrip('/')}/.../{name}")
-                wrote_ok = True
-            except Exception as remote_exc:
-                _cpa_log(f"远程上传失败: {remote_exc}")
-        if not wrote_ok:
-            _cpa_log("token 已换出但本地/远程均未写入成功")
-            _append_sso_pending(email, sso, log_callback=log_callback)
-            return False
-        # 测活：对齐健康号路径，新 token 可能瞬时 403，内置 warmup+retry
-        try:
-            code, summary = _s2cpa.probe_cpa_record(
-                record, proxy=proxy, timeout=40, warmup=True, retries=3
-            )
-            _cpa_log(f"probe HTTP {code}: {(summary or '')[:160]}")
-            if code != 200:
-                _cpa_log("测活未通过，仍保留 auth（可稍后重试 probe）")
-        except Exception as probe_exc:
-            _cpa_log(f"probe 异常: {probe_exc}")
+
         return True
     except Exception as exc:
         if should_stop and should_stop():
             _cpa_log("用户停止，SSO 已保存在 accounts 文件")
             return False
-        _cpa_log(f"直出失败: {exc}")
+        _cpa_log(f"CPA OAuth 流程异常: {exc}")
         _append_sso_pending(email, sso, log_callback=log_callback)
         return False
 
@@ -1898,7 +1947,7 @@ def _wire_runtime_modules(gui_mode=False, headless=None):
         else:
             # 纯 headless 会被 Cloudflare 拦；默认用有界面但后台置底窗口
             headless = False
-    keep_bg = (gui_mode or not headless)
+    keep_bg = False
     _bs.configure(
         get_proxies=get_proxies,
         extension_path=EXTENSION_PATH,
@@ -2043,6 +2092,11 @@ class GrokRegisterGUI:
         tk_label(opt_frame, text="日志:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
         self.log_level_combo = tk_option_menu(opt_frame, self.log_level_var, ["info", "debug"], width=6)
         self.log_level_combo.pack(side=tk.LEFT)
+
+        self.register_mode_var = tk.StringVar(value=str(config.get("register_mode", "browser") or "browser"))
+        tk_label(opt_frame, text="模式:", bg=UI_PANEL_BG).pack(side=tk.LEFT, padx=(12, 2))
+        self.register_mode_combo = tk_option_menu(opt_frame, self.register_mode_var, ["browser", "protocol"], width=8)
+        self.register_mode_combo.pack(side=tk.LEFT)
 
         add_label(1, 2, "代理（可选）:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -2755,6 +2809,7 @@ class GrokRegisterGUI:
         workers = max(1, min(workers, 8, count))
         config["register_count"] = count
         config["register_workers"] = workers
+        config["register_mode"] = str(self.register_mode_var.get() or "browser").strip()
         save_config()
         self.stop_requested = False
         self.success_count = 0
@@ -2763,7 +2818,7 @@ class GrokRegisterGUI:
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
+            ensure_accounts_dir(), f"accounts_{now}.txt"
         )
         self.batch_count = count
         self._batch_started_at = time.time()
@@ -2902,6 +2957,7 @@ class GrokRegisterGUI:
                 self.results.append({"email": email, "sso": sso, "profile": profile})
             if config.get("enable_nsfw", True):
                 self._submit_nsfw(email, sso, log_callback=self.log)
+            add_sso_to_grok2api(sso, email=email, log_callback=self.log)
             cpa_ok = add_sso_to_cpa(
                 sso,
                 email=email,
@@ -3003,6 +3059,7 @@ class GrokRegisterGUI:
                         self.results.append({"email": email, "sso": sso, "profile": profile})
                     if config.get("enable_nsfw", True):
                         self._submit_nsfw(email, sso, log_callback=wlog)
+                    add_sso_to_grok2api(sso, email=email, log_callback=wlog)
                     cpa_ok = add_sso_to_cpa(
                         sso,
                         email=email,
@@ -3128,7 +3185,7 @@ def run_registration_cli(count):
     retry_count_for_slot = 0
     max_slot_retry = 3
     accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
+        ensure_accounts_dir(),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     workers = max(1, min(int(config.get("register_workers", 1) or 1), 8, int(count or 1)))

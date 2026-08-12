@@ -19,10 +19,9 @@ class RuntimeRegressionTests(unittest.TestCase):
             app._wire_runtime_modules()
             cli_kwargs = configure_browser.call_args.kwargs
 
-        self.assertTrue(gui_kwargs["keep_windows_background"])
+        self.assertFalse(gui_kwargs["keep_windows_background"])
         self.assertFalse(gui_kwargs.get("headless"))
-        # CLI 默认后台置底有界面（真 headless 会被 CF 拦）
-        self.assertTrue(cli_kwargs["keep_windows_background"])
+        self.assertFalse(cli_kwargs["keep_windows_background"])
         self.assertFalse(cli_kwargs.get("headless"))
 
     def setUp(self):
