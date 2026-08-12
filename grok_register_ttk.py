@@ -174,6 +174,7 @@ DEFAULT_CONFIG = {
     "mailnest_api_key": "",
     "mailnest_project_code": "x-ai001",
     # grok2api 后台同步：登录用管理员凭据，建议在 config.json 中填写
+    "grok2api_auto_add": False,
     "grok2api_url": "",
     "grok2api_admin_user": "admin",
     "grok2api_admin_password": "",
@@ -604,10 +605,15 @@ def register_account_once(log_callback=None, cancel_callback=None):
 
 
 def add_sso_to_grok2api(raw_token, email="", log_callback=None) -> bool:
-    """自动将注册成功获取到的 SSO 凭据无缝推送到 grok2api 后台 (Web 账号池)。"""
+    """自动将注册成功获取到的 SSO 凭据无缝推送到 grok2api 后台 (Web 账号池)。
+
+    需开启 grok2api_auto_add 且配置 grok2api_url 与管理员密码才会上传。
+    """
     import urllib.request
     import urllib.parse
 
+    if not config.get("grok2api_auto_add", False):
+        return True
     grok2api_url = str(config.get("grok2api_url", "") or "").strip().rstrip("/")
     if not grok2api_url:
         return True
@@ -2341,6 +2347,60 @@ class GrokRegisterGUI:
         c_label(2, 2, "管理密钥:")
         c_field(tk_entry(self.cpa_frame, textvariable=self.cpa_management_key_var, width=28), 2, 3)
 
+        # SSO → grok2api 可选
+        self.grok2api_frame = tk.LabelFrame(
+            config_frame,
+            text="SSO → grok2api（可选）",
+            bg=UI_PANEL_BG,
+            fg=UI_FG,
+            padx=8,
+            pady=6,
+            relief=tk.GROOVE,
+            borderwidth=1,
+        )
+        self.grok2api_frame.grid(row=5, column=0, columnspan=4, sticky=tk.EW, pady=(6, 2))
+        self.grok2api_frame.grid_columnconfigure(1, weight=1, minsize=240)
+        self.grok2api_frame.grid_columnconfigure(3, weight=1, minsize=240)
+
+        self.grok2api_auto_add_var = tk.BooleanVar(value=bool(config.get("grok2api_auto_add", False)))
+        tk_checkbutton(
+            self.grok2api_frame,
+            text="开启后注册成功会将 SSO 同步到 grok2api Web 账号池（不勾选则不同步）",
+            variable=self.grok2api_auto_add_var,
+        ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=3)
+
+        self._grok2api_detail_widgets = []
+        def g_label(row, col, text):
+            w = tk_label(self.grok2api_frame, text=text, bg=UI_PANEL_BG)
+            w.grid(row=row, column=col, sticky=tk.W, padx=(0, 6), pady=3)
+            self._grok2api_detail_widgets.append(w)
+            return w
+
+        def g_field(widget, row, col, columnspan=1, sticky=tk.EW):
+            widget.grid(row=row, column=col, columnspan=columnspan, sticky=sticky, padx=(0, 14), pady=3)
+            self._grok2api_detail_widgets.append(widget)
+            return widget
+
+        self.grok2api_url_var = tk.StringVar(value=str(config.get("grok2api_url", "")))
+        self.grok2api_admin_user_var = tk.StringVar(value=str(config.get("grok2api_admin_user", "admin")))
+        self.grok2api_admin_password_var = tk.StringVar(value=str(config.get("grok2api_admin_password", "")))
+        g_label(1, 0, "grok2api 地址:")
+        g_field(tk_entry(self.grok2api_frame, textvariable=self.grok2api_url_var, width=34), 1, 1)
+        g_label(1, 2, "说明:")
+        g_field(
+            tk_label(self.grok2api_frame, text="本地填 http://127.0.0.1:8000，云端填远程地址", bg=UI_PANEL_BG),
+            1,
+            3,
+            sticky=tk.W,
+        )
+        g_label(2, 0, "管理员账号:")
+        g_field(tk_entry(self.grok2api_frame, textvariable=self.grok2api_admin_user_var, width=20), 2, 1)
+        g_label(2, 2, "管理员密码:")
+        g_field(tk_entry(self.grok2api_frame, textvariable=self.grok2api_admin_password_var, width=28, show="*"), 2, 3)
+
+        self.grok2api_auto_add_var.trace_add("write", lambda *_: self._refresh_grok2api_fields())
+        self._refresh_grok2api_fields()
+
         self.email_provider_var.trace_add("write", lambda *_: self._refresh_provider_fields())
         self.cpa_auto_add_var.trace_add("write", lambda *_: self._refresh_cpa_fields())
         self._refresh_provider_fields()
@@ -2445,6 +2505,15 @@ class GrokRegisterGUI:
             else:
                 widget.grid_remove()
 
+    def _refresh_grok2api_fields(self):
+        """未开启 grok2api 同步时隐藏 grok2api 详情配置。"""
+        enabled = bool(self.grok2api_auto_add_var.get())
+        for widget in getattr(self, "_grok2api_detail_widgets", []):
+            if enabled:
+                widget.grid()
+            else:
+                widget.grid_remove()
+
     def log(self, message):
         if not should_emit_log(message):
             return
@@ -2521,6 +2590,10 @@ class GrokRegisterGUI:
             config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
             config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
             config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+            config["grok2api_auto_add"] = bool(self.grok2api_auto_add_var.get())
+            config["grok2api_url"] = self.grok2api_url_var.get().strip()
+            config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+            config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -2768,6 +2841,10 @@ class GrokRegisterGUI:
         config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip()
         config["cpa_remote_url"] = self.cpa_remote_url_var.get().strip()
         config["cpa_management_key"] = self.cpa_management_key_var.get().strip()
+        config["grok2api_auto_add"] = bool(self.grok2api_auto_add_var.get())
+        config["grok2api_url"] = self.grok2api_url_var.get().strip()
+        config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])

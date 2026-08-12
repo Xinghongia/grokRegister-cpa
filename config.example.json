@@ -32,6 +32,7 @@
   "yyds_default_domain": "",
   "mailnest_api_key": "",
   "mailnest_project_code": "x-ai001",
+  "grok2api_auto_add": false,
   "grok2api_url": "",
   "grok2api_admin_user": "admin",
   "grok2api_admin_password": ""
