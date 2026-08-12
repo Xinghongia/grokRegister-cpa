@@ -3280,10 +3280,12 @@ class GrokRegisterGUI:
             )
             self._record_success()
             self.update_stats()
+            done = self.success_count + self.fail_count
+            total = max(int(getattr(self, "batch_count", 0) or 0), 1)
             if cpa_ok:
-                self.log(f"[+] 注册成功: {email}")
+                self.log(f"[+] 注册成功 ({done}/{total}): {email}")
             else:
-                self.log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                self.log(f"[+] 注册成功 ({done}/{total}，SSO 已保存，CPA 入库失败): {email}")
 
         try:
             stats = run_protocol_pipeline_batch(
@@ -3383,10 +3385,12 @@ class GrokRegisterGUI:
                     self._record_success()
                     retry_count_for_slot = 0
                     i += 1
+                    done = self.success_count + self.fail_count
+                    total = max(int(getattr(self, "batch_count", 0) or 0), 1)
                     if cpa_ok:
-                        wlog(f"[+] 注册成功: {email}")
+                        wlog(f"[+] 注册成功 ({done}/{total}): {email}")
                     else:
-                        wlog(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                        wlog(f"[+] 注册成功 ({done}/{total}，SSO 已保存，CPA 入库失败): {email}")
                     if (
                         self.success_count > 0
                         and self.success_count % MEMORY_CLEANUP_INTERVAL == 0
@@ -3595,10 +3599,11 @@ def run_registration_cli(count):
             with stats_lock:
                 success_count += 1
                 sc = success_count
+            done = sc + fail_count
             if cpa_ok:
-                cli_log(f"[+] 注册成功: {email}")
+                cli_log(f"[+] 注册成功 ({done}/{count}): {email}")
             else:
-                cli_log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                cli_log(f"[+] 注册成功 ({done}/{count}，SSO 已保存，CPA 入库失败): {email}")
             cli_log(f"[*] 当前统计: 成功 {sc} | 失败 {fail_count}")
 
         try:
@@ -3694,9 +3699,9 @@ def run_registration_cli(count):
                         i += 1
                         retry = 0
                         if cpa_ok:
-                            cli_log(f"[W{wid+1}] [+] 注册成功: {email}")
+                            cli_log(f"[W{wid+1}] [+] 注册成功 ({i}/{n}): {email}")
                         else:
-                            cli_log(f"[W{wid+1}] [+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                            cli_log(f"[W{wid+1}] [+] 注册成功 ({i}/{n}，SSO 已保存，CPA 入库失败): {email}")
                     except RegistrationCancelled:
                         break
                     except EmailDomainRejected as exc:
@@ -3824,10 +3829,11 @@ def run_registration_cli(count):
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1
+                done = success_count + fail_count
                 if cpa_ok:
-                    cli_log(f"[+] 注册成功: {email}")
+                    cli_log(f"[+] 注册成功 ({done}/{count}): {email}")
                 else:
-                    cli_log(f"[+] 注册成功（SSO 已保存，CPA 入库失败）: {email}")
+                    cli_log(f"[+] 注册成功 ({done}/{count}，SSO 已保存，CPA 入库失败): {email}")
                 cli_log(f"[*] 当前统计: 成功 {success_count} | 失败 {fail_count}")
                 if success_count > 0 and success_count % MEMORY_CLEANUP_INTERVAL == 0 and i < count:
                     cleanup_runtime_memory(
