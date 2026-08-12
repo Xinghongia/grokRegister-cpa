@@ -22,6 +22,73 @@ import browser_session as _bs
 LogFn = Optional[Callable[[str], None]]
 StopFn = Optional[Callable[[], bool]]
 
+# OneTrust cookie 弹窗相关 class 片段：查找授权按钮时应排除，避免误点
+_OT_CLASS_HINTS = ("onetrust", "ot-sdk", "ot-close", "save-preference", "ot-pc-")
+
+
+def _find_clickable_button(page_obj, keywords, timeout=0.5):
+    """遍历页面上所有 button/input[type=submit]，返回文本/值匹配任一关键词的元素。
+
+    相比 page_obj.ele(...)，这里用 eles() 全量抓取再按文本匹配，
+    避免 DrissionPage 4.1.1.4 中 ele() 选择器在该动态页面失效、以及 is_valid 属性缺失的问题。
+    """
+    kws = [str(k).strip().lower() for k in keywords if str(k).strip()]
+    if not kws:
+        return None
+    candidates = []
+    try:
+        candidates.extend(page_obj.eles("tag:button", timeout=timeout) or [])
+    except Exception:
+        pass
+    try:
+        candidates.extend(page_obj.eles("css:input[type='submit']", timeout=timeout) or [])
+    except Exception:
+        pass
+
+    seen = set()
+    for el in candidates:
+        try:
+            text = str(el.text or "").strip()
+            value = str(el.attr("value") or "").strip()
+            cls = str(el.attr("class") or "")
+        except Exception:
+            continue
+        hay = f"{text} {value}".strip().lower()
+        if not hay:
+            continue
+        if hay in seen:
+            continue
+        seen.add(hay)
+        # 跳过 OneTrust 弹窗按钮，避免误点"全部允许/确认我的选择"
+        if any(h in cls.lower() for h in _OT_CLASS_HINTS):
+            continue
+        if any(k in hay for k in kws):
+            return el
+    return None
+
+
+def _dismiss_consent_banner(page_obj, log=None):
+    """尝试关闭 OneTrust cookie 弹窗，避免遮挡授权按钮。"""
+    for selector in (
+        "#onetrust-accept-btn-handler",
+        "css:.ot-close-icon",
+        "text:接受所有 Cookie",
+        "text:Accept All",
+        "text:全部允许",
+    ):
+        try:
+            el = page_obj.ele(selector, timeout=0.5)
+            if el:
+                try:
+                    el.click()
+                except Exception:
+                    el.click(by_js=True)
+                if log:
+                    log("[CPA-OAuth] 已尝试关闭 OneTrust Cookie 弹窗")
+                return
+        except Exception:
+            continue
+
 
 def start_cpa_xai_auth(cpa_url: str, management_key: str, timeout: int = 15) -> dict:
     """调 CPA GET /v0/management/xai-auth-url，返回 dict(url, state, user_code, ...)"""
@@ -175,8 +242,10 @@ def authorize_in_browser(
             log(f"[CPA-OAuth] 浏览器（复用注册窗口）打开授权页面: {auth_url}")
         page_obj.get(auth_url, timeout=20)
 
-        # 3. 页面交互逻辑：检测授权状态并自动处理按钮/表单（如“继续”、“Allow”、“授权”等）
-        deadline = time.time() + 35
+        # 3. 页面交互逻辑：先尝试关闭 cookie 弹窗，再自动点击“继续/Continue”和“Allow/允许”等按钮
+        _dismiss_consent_banner(page_obj, log=log)
+
+        deadline = time.time() + 45
         clicked = False
         while time.time() < deadline:
             if should_stop and should_stop():
@@ -188,47 +257,41 @@ def authorize_in_browser(
                     log("[CPA-OAuth] 浏览器已跳转至授权完成页")
                 return True
 
-            # 自动匹配各种界面的确认/授权按钮（包括“继续”、“Allow”、“同意”、“Confirm”等）
-            try:
-                btn = None
-                for selector in (
-                    "@type=submit",
-                    "css:form button[type='submit']",
-                    "text:继续", "text:Continue", "text:Allow", "text:允许",
-                    "text:Authorize", "text:授权", "text:Confirm", "text:确认"
-                ):
-                    try:
-                        found = page_obj.ele(selector, timeout=0.3)
-                        if found and found.is_valid:
-                            btn = found
-                            break
-                    except Exception:
-                        pass
+            # 设备确认页：继续 / Continue
+            btn = _find_clickable_button(
+                page_obj,
+                ("继续", "continue", "next", "下一步"),
+                timeout=0.4,
+            )
+            # 授权页：Allow / 允许 / Authorize / 授权 / Confirm / 确认 / 同意
+            if not btn:
+                btn = _find_clickable_button(
+                    page_obj,
+                    ("allow", "允许", "authorize", "授权", "confirm", "确认", "同意", "yes", "提交"),
+                    timeout=0.4,
+                )
 
-                if not btn:
-                    for b in page_obj.eles("tag:button") or []:
-                        txt = str(b.text or "").strip().lower()
-                        if any(kw in txt for kw in ("继续", "continue", "allow", "允许", "authorize", "授权", "confirm", "确认", "yes", "同意", "提交")):
-                            btn = b
-                            break
-
-                if btn and btn.is_valid:
-                    btn_text = str(btn.text or "").strip()
-                    if log:
-                        log(f"[CPA-OAuth] 找到授权提交按钮: {btn_text!r}，正在触发点击...")
+            if btn:
+                btn_text = str(btn.text or btn.attr("value") or "").strip()
+                if log:
+                    log(f"[CPA-OAuth] 找到授权按钮 {btn_text!r}，正在点击...")
+                try:
+                    btn.click()
+                except Exception:
                     try:
-                        btn.click()
-                    except Exception:
                         btn.click(by_js=True)
-                    clicked = True
-                    time.sleep(2)
-                    url_after = str(page_obj.url or "").lower()
-                    if "device/done" in url_after or "authorized" in url_after or "success" in url_after:
+                    except Exception as click_exc:
                         if log:
-                            log("[CPA-OAuth] 点击按钮后浏览器已跳转至授权完成页")
-                        return True
-            except Exception:
-                pass
+                            log(f"[CPA-OAuth] 点击按钮失败: {click_exc}")
+                        time.sleep(1)
+                        continue
+                clicked = True
+                time.sleep(2)
+                url_after = str(page_obj.url or "").lower()
+                if "device/done" in url_after or "authorized" in url_after or "success" in url_after:
+                    if log:
+                        log("[CPA-OAuth] 点击按钮后浏览器已跳转至授权完成页")
+                    return True
 
             time.sleep(1)
 

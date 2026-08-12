@@ -44,7 +44,7 @@ DEFAULT_UA = (
 )
 
 _SITE_KEY_RE = re.compile(r"0x4AAAAAAA[a-zA-Z0-9_-]+")
-_JS_SRC_RE = re.compile(r'src="(/_next/static/[^"]+\.js)"')
+_JS_SRC_RE = re.compile(r'src="(/_next/static/[^"]+?\.js)(?:\?[^"]*)?"')
 _HEX40_RE = re.compile(r"[a-fA-F0-9]{40,50}")
 _FLIGHT_RE = re.compile(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)')
 _SET_COOKIE_URL_RE = re.compile(
