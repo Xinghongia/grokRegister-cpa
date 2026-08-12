@@ -45,6 +45,7 @@ class RuntimeRegressionTests(unittest.TestCase):
         gui = object.__new__(app.GrokRegisterGUI)
         gui.is_running = True
         gui.sso_convert_running = False
+        gui.grok2api_convert_running = False
         gui.stop_requested = False
         gui.stop_btn = MagicMock()
         gui.status_var = MagicMock()

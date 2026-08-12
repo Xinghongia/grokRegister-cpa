@@ -693,6 +693,135 @@ def add_sso_to_grok2api(raw_token, email="", log_callback=None) -> bool:
         return False
 
 
+def add_sso_batch_to_grok2api(
+    entries,
+    log_callback=None,
+    should_stop=None,
+    max_accounts_per_request: int = 500,
+) -> dict:
+    """批量将 SSO 凭据导入 grok2api Web 账号池（补转用）。
+
+    entries: 可迭代的 (email, sso) 列表。
+    返回 {"total", "ok", "fail", "skipped", "stopped"}。
+    """
+    import urllib.request
+    import urllib.parse
+
+    stats = {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "stopped": False}
+
+    if not config.get("grok2api_auto_add", False):
+        if log_callback:
+            log_callback("[grok2api] 未开启 grok2api 同步，跳过")
+        return stats
+    grok2api_url = str(config.get("grok2api_url", "") or "").strip().rstrip("/")
+    if not grok2api_url:
+        if log_callback:
+            log_callback("[grok2api] 未配置 grok2api_url，跳过")
+        return stats
+    admin_user = str(config.get("grok2api_admin_user", "admin") or "admin").strip()
+    admin_password = str(config.get("grok2api_admin_password", "") or "").strip()
+    if not admin_password:
+        if log_callback:
+            log_callback("[grok2api] 未配置 grok2api_admin_password，跳过")
+        return stats
+
+    # 去重 SSO，收集 (email, sso)
+    items = []
+    seen = set()
+    for email, sso in entries:
+        sso = _normalize_sso_token(sso)
+        if not sso:
+            continue
+        if sso in seen:
+            continue
+        seen.add(sso)
+        items.append((email or "", sso))
+    stats["total"] = len(items)
+    if not items:
+        if log_callback:
+            log_callback("[grok2api] 没有可导入的 SSO")
+        return stats
+
+    def _g2a_log(msg):
+        if log_callback:
+            log_callback(f"[grok2api] {str(msg).strip()}")
+
+    # 登录获取 admin token
+    try:
+        login_url = f"{grok2api_url}/api/admin/v1/auth/login"
+        login_req = urllib.request.Request(
+            login_url,
+            data=json.dumps({"username": admin_user, "password": admin_password}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(login_req, timeout=10) as resp:
+            if resp.status != 200:
+                _g2a_log(f"⚠️ 登录 grok2api 失败 HTTP {resp.status}")
+                stats["fail"] = len(items)
+                return stats
+            login_data = json.loads(resp.read().decode("utf-8"))
+        tokens = (login_data.get("data") or {}).get("tokens") or {}
+        admin_token = tokens.get("accessToken") or login_data.get("accessToken")
+        if not admin_token:
+            _g2a_log("⚠️ 解析 grok2api admin token 失败")
+            stats["fail"] = len(items)
+            return stats
+    except Exception as exc:
+        _g2a_log(f"⚠️ 登录 grok2api 异常: {exc}")
+        stats["fail"] = len(items)
+        return stats
+
+    url = f"{grok2api_url}/api/admin/v1/accounts/web/import"
+    # 分批上传，每批构造 grok2api 标准文档结构
+    for start in range(0, len(items), max_accounts_per_request):
+        if should_stop and should_stop():
+            stats["stopped"] = True
+            stats["fail"] += max(0, len(items) - start)
+            break
+        batch = items[start:start + max_accounts_per_request]
+        doc = {
+            "provider": "grok_web",
+            "accounts": [
+                {"email": email, "sso_token": sso, "token": sso, "sso": sso}
+                for email, sso in batch
+            ],
+        }
+        json_content = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+        boundary = "----WebKitFormBoundary" + secrets.token_hex(16)
+        body = []
+        body.append(f"--{boundary}".encode("utf-8"))
+        body.append(b'Content-Disposition: form-data; name="file"; filename="grok2api_import.json"')
+        body.append(b'Content-Type: application/json\r\n')
+        body.append(json_content)
+        body.append(f"--{boundary}--\r\n".encode("utf-8"))
+        payload = b"\r\n".join(body)
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {admin_token}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if resp.status == 200:
+                    stats["ok"] += len(batch)
+                    _g2a_log(f"✅ 批量导入 {len(batch)} 个成功（第 {start // max_accounts_per_request + 1} 批）")
+                else:
+                    stats["fail"] += len(batch)
+                    _g2a_log(f"⚠️ 批量导入失败 HTTP {resp.status}")
+        except Exception as exc:
+            stats["fail"] += len(batch)
+            _g2a_log(f"⚠️ 批量导入异常: {exc}")
+
+    _g2a_log(f"导入完成: 成功 {stats['ok']} | 失败 {stats['fail']} | 跳过 {stats['skipped']}")
+    return stats
+
+
 def add_sso_to_cpa(raw_token, email="", log_callback=None, should_stop=None) -> bool:
     """SSO → 通过 CPA 官方 OAuth 流程（xai-auth-url + 浏览器授权）入库 CPA。
 
@@ -1982,6 +2111,8 @@ class GrokRegisterGUI:
         self.is_running = False
         self.sso_convert_running = False
         self.sso_convert_stop_requested = False
+        self.grok2api_convert_running = False
+        self.grok2api_convert_stop_requested = False
         self.batch_count = 0
         self.success_count = 0
         self.fail_count = 0
@@ -2429,6 +2560,12 @@ class GrokRegisterGUI:
             command=self.start_sso_recovery,
         )
         self.sso_convert_btn.pack(side=tk.LEFT, padx=5)
+        self.grok2api_convert_btn = tk_button(
+            btn_frame,
+            text="补转 grok2api",
+            command=self.start_grok2api_recovery,
+        )
+        self.grok2api_convert_btn.pack(side=tk.LEFT, padx=5)
         self.clear_btn = tk_button(btn_frame, text="清空日志", command=self.clear_log)
         self.clear_btn.pack(side=tk.LEFT, padx=5)
 
@@ -2611,7 +2748,9 @@ class GrokRegisterGUI:
         threading.Thread(target=_job, daemon=True).start()
 
     def _on_check_done(self, text, all_ok):
-        self.check_btn.config(state=tk.DISABLED if self.sso_convert_running else tk.NORMAL)
+        self.check_btn.config(
+            state=tk.DISABLED if (self.sso_convert_running or self.grok2api_convert_running) else tk.NORMAL
+        )
         for line in str(text).splitlines():
             self.log(f"[检查] {line}")
         self.status_var.set("检查通过" if all_ok else "检查有失败项")
@@ -2706,6 +2845,91 @@ class GrokRegisterGUI:
             self.status_var.set("SSO 补转完成")
             self.status_label.config(foreground="green")
 
+    def start_grok2api_recovery(self):
+        """扫描 accounts_*.txt / sso_pending.txt，将缺失 SSO 批量导入 grok2api。"""
+        if self.is_running:
+            self.log("[!] 注册任务正在运行，请结束后再补转 grok2api")
+            return
+        if self.sso_convert_running:
+            self.log("[!] SSO(CPA) 补转正在运行，请结束后再补转 grok2api")
+            return
+        if self.grok2api_convert_running:
+            self.log("[!] grok2api 补转已经在运行")
+            return
+        if not config.get("grok2api_auto_add", False):
+            self.log("[!] 请先在「SSO → grok2api」面板开启同步")
+            return
+        if not config.get("grok2api_url", "") or not config.get("grok2api_admin_password", ""):
+            self.log("[!] 请先配置 grok2api 地址与管理员密码")
+            return
+
+        config["proxy"] = self.proxy_var.get().strip()
+        config["grok2api_auto_add"] = bool(self.grok2api_auto_add_var.get())
+        config["grok2api_url"] = self.grok2api_url_var.get().strip()
+        config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
+        config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
+        save_config()
+
+        self.grok2api_convert_running = True
+        self.grok2api_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED)
+        self.sso_convert_btn.config(state=tk.DISABLED)
+        self.grok2api_convert_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.check_btn.config(state=tk.DISABLED)
+        self.status_var.set("grok2api 补转中...")
+        self.status_label.config(foreground="blue")
+        self.log("[*] 开始扫描 accounts_*.txt 和 sso_pending.txt，补转导入 grok2api...")
+
+        def _job():
+            result = None
+            error = ""
+            try:
+                entries, files = _s2cpa.scan_sso_entries(APP_DIR)
+                self.log(
+                    f"[补转] 扫描到 {len(files)} 个 TXT，"
+                    f"去重后 {len(entries)} 个 SSO"
+                )
+                if not entries:
+                    result = {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "stopped": False}
+                    self.log("[补转] [!] 未找到可导入的 SSO")
+                else:
+                    result = add_sso_batch_to_grok2api(
+                        entries,
+                        log_callback=lambda message: self.log(f"[补转] {str(message).strip()}"),
+                        should_stop=lambda: self.grok2api_convert_stop_requested,
+                    )
+            except Exception as exc:
+                error = str(exc)
+            self.ui_queue.put((self._on_grok2api_recovery_done, (result, error)))
+
+        threading.Thread(target=_job, daemon=True).start()
+
+    def _on_grok2api_recovery_done(self, result, error):
+        self.grok2api_convert_running = False
+        self.grok2api_convert_stop_requested = False
+        self.start_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.sso_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.grok2api_convert_btn.config(state=tk.DISABLED if self.is_running else tk.NORMAL)
+        self.stop_btn.config(state=tk.NORMAL if self.is_running else tk.DISABLED)
+        self.check_btn.config(state=tk.NORMAL)
+        if error:
+            self.log(f"[补转] [-] grok2api 任务异常: {error}")
+            self.status_var.set("grok2api 补转失败")
+            self.status_label.config(foreground="red")
+            return
+
+        result = result or {}
+        if result.get("stopped"):
+            self.status_var.set("grok2api 补转已停止")
+            self.status_label.config(foreground="orange")
+        elif result.get("fail"):
+            self.status_var.set("grok2api 补转有失败项")
+            self.status_label.config(foreground="orange")
+        else:
+            self.status_var.set("grok2api 补转完成")
+            self.status_label.config(foreground="green")
+
     def _record_failure(self, exc):
         kind = classify_failure(exc)
         lock = getattr(self, "_stats_lock", None)
@@ -2734,9 +2958,10 @@ class GrokRegisterGUI:
         if self._queue_ui_call(self._set_running_ui, running):
             return
         self.is_running = running
-        busy = running or self.sso_convert_running
+        busy = running or self.sso_convert_running or self.grok2api_convert_running
         self.start_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         self.sso_convert_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
+        self.grok2api_convert_btn.config(state=tk.DISABLED if busy else tk.NORMAL)
         self.stop_btn.config(state=tk.NORMAL if busy else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
         self.status_label.config(foreground="blue" if running else "green")
@@ -2812,6 +3037,9 @@ class GrokRegisterGUI:
             return
         if self.sso_convert_running:
             self.log("[!] SSO 补转正在运行，请结束后再开始注册")
+            return
+        if self.grok2api_convert_running:
+            self.log("[!] grok2api 补转正在运行，请结束后再开始注册")
             return
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
@@ -2935,6 +3163,15 @@ class GrokRegisterGUI:
         ).start()
 
     def stop_registration(self):
+        if getattr(self, "grok2api_convert_running", False) and not self.is_running:
+            if self.grok2api_convert_stop_requested:
+                return
+            self.grok2api_convert_stop_requested = True
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("正在停止 grok2api 补转...")
+            self.status_label.config(foreground="orange")
+            self.log("[!] 用户停止 grok2api 补转（当前批次完成后停止）")
+            return
         if self.sso_convert_running and not self.is_running:
             if self.sso_convert_stop_requested:
                 return
