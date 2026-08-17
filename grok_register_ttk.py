@@ -178,6 +178,7 @@ DEFAULT_CONFIG = {
     "grok2api_url": "",
     "grok2api_admin_user": "admin",
     "grok2api_admin_password": "",
+    "grok2api_pool": "web",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
     # 协议 HTTP 注册（对齐 grok-register-new）：默认开启，避免浏览器 UI 打 bot 标
@@ -604,8 +605,180 @@ def register_account_once(log_callback=None, cancel_callback=None):
     return email, profile.get("password", ""), sso, profile
 
 
+def _grok2api_admin_login(grok2api_url, admin_user, admin_password, log=None):
+    """登录 grok2api 获取 admin access token，失败返回 None。"""
+    import urllib.request
+
+    def _g2a_log(msg):
+        if log:
+            log(f"[grok2api] {str(msg).strip()}")
+
+    try:
+        login_url = f"{grok2api_url}/api/admin/v1/auth/login"
+        login_req = urllib.request.Request(
+            login_url,
+            data=json.dumps({"username": admin_user, "password": admin_password}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(login_req, timeout=10) as resp:
+            if resp.status != 200:
+                _g2a_log(f"⚠️ 登录 grok2api 失败 HTTP {resp.status}")
+                return None
+            login_data = json.loads(resp.read().decode("utf-8"))
+        tokens = (login_data.get("data") or {}).get("tokens") or {}
+        admin_token = tokens.get("accessToken") or login_data.get("accessToken")
+        if not admin_token:
+            _g2a_log("⚠️ 解析 grok2api admin token 失败")
+            return None
+        return admin_token
+    except Exception as exc:
+        _g2a_log(f"⚠️ 登录 grok2api 异常: {exc}")
+        return None
+
+
+def _grok2api_import_sso_doc(grok2api_url, admin_token, doc, pool, log=None, timeout=30):
+    """将一个 SSO 导入文档 multipart 上传到 grok2api 对应池。
+
+    pool: "web" -> /accounts/web/import, "console" -> /accounts/console/import
+    doc: {"provider": "grok_web"|"grok_console", "accounts": [...]}
+    返回 (成功数, 文档中账号数)。
+    """
+    import urllib.request
+
+    def _g2a_log(msg):
+        if log:
+            log(f"[grok2api] {str(msg).strip()}")
+
+    accounts = (doc or {}).get("accounts") or []
+    if not accounts:
+        return 0, 0
+    # web -> /accounts/web/import, console -> /accounts/console/import
+    endpoint = "web" if pool == "web" else "console"
+    url = f"{grok2api_url}/api/admin/v1/accounts/{endpoint}/import"
+
+    json_content = json.dumps(doc, ensure_ascii=False).encode("utf-8")
+    boundary = "----WebKitFormBoundary" + secrets.token_hex(16)
+    body = []
+    body.append(f"--{boundary}".encode("utf-8"))
+    body.append(b'Content-Disposition: form-data; name="file"; filename="sso_import.json"')
+    body.append(b'Content-Type: application/json\r\n')
+    body.append(json_content)
+    body.append(f"--{boundary}--\r\n".encode("utf-8"))
+    payload = b"\r\n".join(body)
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # SSE 事件流：读完整响应直到 complete/error 事件
+            body_data = (resp.read() or b"").decode("utf-8", errors="replace")
+            if resp.status != 200:
+                _g2a_log(f"⚠️ 导入失败 HTTP {resp.status}: {body_data[:200]}")
+                return 0, len(documents)
+            # 解析 SSE，统计 complete 事件中的 created/updated/skipped
+            created = updated = skipped = 0
+            event = ""
+            data_lines = []
+            for line in body_data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    event = line[len("event:"):].strip()
+                    data_lines = []
+                elif line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+                    try:
+                        payload_obj = json.loads("\n".join(data_lines))
+                    except Exception:
+                        continue
+                    if event == "complete":
+                        created = int(payload_obj.get("created", 0) or 0)
+                        updated = int(payload_obj.get("updated", 0) or 0)
+                        skipped = int(payload_obj.get("skipped", 0) or 0)
+                    elif event == "error":
+                        _g2a_log(f"⚠️ 导入报错: {payload_obj.get('message', '')}")
+                        return 0, len(accounts)
+            _g2a_log(f"✅ 导入完成: 新增 {created} | 更新 {updated} | 跳过 {skipped}")
+            return created + updated, len(accounts)
+    except Exception as exc:
+        _g2a_log(f"⚠️ 导入请求异常: {exc}")
+        return 0, len(accounts)
+
+
+def _grok2api_convert_web_to_build(grok2api_url, admin_token, log=None, timeout=120):
+    """调用 grok2api 将全部未关联的 Web 账号转换为 Build 账号（SSE 流式）。
+
+    返回 (转换成功数, 失败数)。
+    """
+    import urllib.request
+
+    def _g2a_log(msg):
+        if log:
+            log(f"[grok2api] {str(msg).strip()}")
+
+    url = f"{grok2api_url}/api/admin/v1/accounts/web/convert-to-build"
+    body_payload = json.dumps({"all": True, "strategy": "missing"}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body_payload,
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body_data = (resp.read() or b"").decode("utf-8", errors="replace")
+            if resp.status != 200:
+                _g2a_log(f"⚠️ 转换请求失败 HTTP {resp.status}: {body_data[:200]}")
+                return 0, 0
+            created = linked = failed = 0
+            event = ""
+            data_lines = []
+            for line in body_data.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("event:"):
+                    event = line[len("event:"):].strip()
+                    data_lines = []
+                elif line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+                    try:
+                        payload_obj = json.loads("\n".join(data_lines))
+                    except Exception:
+                        continue
+                    if event == "complete":
+                        created = int(payload_obj.get("created", 0) or 0)
+                        linked = int(payload_obj.get("linked", 0) or 0)
+                        failed = int(payload_obj.get("failed", 0) or 0)
+                    elif event == "error":
+                        _g2a_log(f"⚠️ 转换报错: {payload_obj.get('message', '')}")
+                        return 0, 0
+            _g2a_log(f"✅ Web→Build 转换: 新增 {created} | 关联 {linked} | 失败 {failed}")
+            return created + linked, failed
+    except Exception as exc:
+        _g2a_log(f"⚠️ 转换请求异常: {exc}")
+        return 0, 0
+
+
 def add_sso_to_grok2api(raw_token, email="", log_callback=None) -> bool:
-    """自动将注册成功获取到的 SSO 凭据无缝推送到 grok2api 后台 (Web 账号池)。
+    """自动将注册成功获取到的 SSO 凭据推送到 grok2api 后台。
+
+    入库目标由 grok2api_pool 决定：
+      - web:    导入 Grok Web 账号池
+      - console:导入 Grok Console 账号池
+      - build:  先导入 Web，再自动 convert-to-build 转成 Grok Build
 
     需开启 grok2api_auto_add 且配置 grok2api_url 与管理员密码才会上传。
     """
@@ -632,65 +805,46 @@ def add_sso_to_grok2api(raw_token, email="", log_callback=None) -> bool:
         if log_callback:
             log_callback(f"[grok2api] {str(msg).strip()}")
 
-    try:
-        # 1. 登录 grok2api 获取 admin token
-        login_url = f"{grok2api_url}/api/admin/v1/auth/login"
-        login_req = urllib.request.Request(
-            login_url,
-            data=json.dumps({"username": admin_user, "password": admin_password}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(login_req, timeout=10) as resp:
-            if resp.status != 200:
-                _g2a_log(f"⚠️ 登录 grok2api 失败 HTTP {resp.status}")
-                return False
-            login_data = json.loads(resp.read().decode("utf-8"))
+    pool = str(config.get("grok2api_pool", "web") or "web").strip().lower()
+    if pool not in ("web", "build", "console"):
+        pool = "web"
 
-        tokens = (login_data.get("data") or {}).get("tokens") or {}
-        admin_token = tokens.get("accessToken") or login_data.get("accessToken")
-        if not admin_token:
-            _g2a_log("⚠️ 解析 grok2api admin token 失败")
+    admin_token = _grok2api_admin_login(grok2api_url, admin_user, admin_password, log=_g2a_log)
+    if not admin_token:
+        return False
+
+    # 导入目标池的文档格式
+    item = {"sso_token": sso, "token": sso, "sso": sso, "email": email or ""}
+    doc = {"provider": "grok_web", "accounts": [item]}
+    if pool == "console":
+        doc = {"provider": "grok_console", "accounts": [item]}
+
+    ok_count, total = _grok2api_import_sso_doc(
+        grok2api_url,
+        admin_token,
+        doc,
+        pool,
+        log=_g2a_log,
+        timeout=30,
+    )
+    if ok_count <= 0:
+        _g2a_log("⚠️ SSO 导入 grok2api 失败")
+        return False
+
+    if pool == "build":
+        _g2a_log("入库目标为 Build，触发 Web→Build 自动转换...")
+        converted, conv_failed = _grok2api_convert_web_to_build(
+            grok2api_url,
+            admin_token,
+            log=_g2a_log,
+            timeout=120,
+        )
+        if converted <= 0 and conv_failed > 0:
+            _g2a_log("⚠️ Web→Build 转换失败")
             return False
 
-        # 2. 提交 multipart 文件导入请求
-        url = f"{grok2api_url}/api/admin/v1/accounts/web/import"
-        item = {
-            "sso_token": sso,
-            "token": sso,
-            "sso": sso,
-            "email": email or ""
-        }
-        json_content = json.dumps([item], ensure_ascii=False).encode("utf-8")
-
-        boundary = "----WebKitFormBoundary" + secrets.token_hex(16)
-        body = []
-        body.append(f"--{boundary}".encode("utf-8"))
-        body.append(b'Content-Disposition: form-data; name="file"; filename="sso_import.json"')
-        body.append(b'Content-Type: application/json\r\n')
-        body.append(json_content)
-        body.append(f"--{boundary}--\r\n".encode("utf-8"))
-        payload = b"\r\n".join(body)
-
-        import_req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {admin_token}",
-                "Content-Type": f"multipart/form-data; boundary={boundary}"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(import_req, timeout=15) as resp:
-            if resp.status == 200:
-                _g2a_log(f"✅ 账号 {email or ''} 成功同步导入到 grok2api (Web 池)！")
-                return True
-            else:
-                _g2a_log(f"⚠️ 同步导入到 grok2api 失败 HTTP {resp.status}")
-                return False
-    except Exception as exc:
-        _g2a_log(f"⚠️ grok2api 同步请求异常: {exc}")
-        return False
+    _g2a_log(f"✅ 账号 {email or ''} 成功同步到 grok2api ({pool} 池)！")
+    return True
 
 
 def add_sso_batch_to_grok2api(
@@ -699,7 +853,12 @@ def add_sso_batch_to_grok2api(
     should_stop=None,
     max_accounts_per_request: int = 500,
 ) -> dict:
-    """批量将 SSO 凭据导入 grok2api Web 账号池（补转用）。
+    """批量将 SSO 凭据导入 grok2api（补转用）。
+
+    入库目标由 grok2api_pool 决定：
+      - web:    导入 Grok Web 账号池
+      - console:导入 Grok Console 账号池
+      - build:  先导入 Web，再自动 convert-to-build 转成 Grok Build
 
     entries: 可迭代的 (email, sso) 列表。
     返回 {"total", "ok", "fail", "skipped", "stopped"}。
@@ -725,6 +884,10 @@ def add_sso_batch_to_grok2api(
             log_callback("[grok2api] 未配置 grok2api_admin_password，跳过")
         return stats
 
+    pool = str(config.get("grok2api_pool", "web") or "web").strip().lower()
+    if pool not in ("web", "build", "console"):
+        pool = "web"
+
     # 去重 SSO，收集 (email, sso)
     items = []
     seen = set()
@@ -747,32 +910,12 @@ def add_sso_batch_to_grok2api(
             log_callback(f"[grok2api] {str(msg).strip()}")
 
     # 登录获取 admin token
-    try:
-        login_url = f"{grok2api_url}/api/admin/v1/auth/login"
-        login_req = urllib.request.Request(
-            login_url,
-            data=json.dumps({"username": admin_user, "password": admin_password}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(login_req, timeout=10) as resp:
-            if resp.status != 200:
-                _g2a_log(f"⚠️ 登录 grok2api 失败 HTTP {resp.status}")
-                stats["fail"] = len(items)
-                return stats
-            login_data = json.loads(resp.read().decode("utf-8"))
-        tokens = (login_data.get("data") or {}).get("tokens") or {}
-        admin_token = tokens.get("accessToken") or login_data.get("accessToken")
-        if not admin_token:
-            _g2a_log("⚠️ 解析 grok2api admin token 失败")
-            stats["fail"] = len(items)
-            return stats
-    except Exception as exc:
-        _g2a_log(f"⚠️ 登录 grok2api 异常: {exc}")
+    admin_token = _grok2api_admin_login(grok2api_url, admin_user, admin_password, log=_g2a_log)
+    if not admin_token:
         stats["fail"] = len(items)
         return stats
 
-    url = f"{grok2api_url}/api/admin/v1/accounts/web/import"
+    provider = "grok_console" if pool == "console" else "grok_web"
     # 分批上传，每批构造 grok2api 标准文档结构
     for start in range(0, len(items), max_accounts_per_request):
         if should_stop and should_stop():
@@ -781,42 +924,37 @@ def add_sso_batch_to_grok2api(
             break
         batch = items[start:start + max_accounts_per_request]
         doc = {
-            "provider": "grok_web",
+            "provider": provider,
             "accounts": [
                 {"email": email, "sso_token": sso, "token": sso, "sso": sso}
                 for email, sso in batch
             ],
         }
-        json_content = json.dumps(doc, ensure_ascii=False).encode("utf-8")
-        boundary = "----WebKitFormBoundary" + secrets.token_hex(16)
-        body = []
-        body.append(f"--{boundary}".encode("utf-8"))
-        body.append(b'Content-Disposition: form-data; name="file"; filename="grok2api_import.json"')
-        body.append(b'Content-Type: application/json\r\n')
-        body.append(json_content)
-        body.append(f"--{boundary}--\r\n".encode("utf-8"))
-        payload = b"\r\n".join(body)
-
-        try:
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {admin_token}",
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                if resp.status == 200:
-                    stats["ok"] += len(batch)
-                    _g2a_log(f"✅ 批量导入 {len(batch)} 个成功（第 {start // max_accounts_per_request + 1} 批）")
-                else:
-                    stats["fail"] += len(batch)
-                    _g2a_log(f"⚠️ 批量导入失败 HTTP {resp.status}")
-        except Exception as exc:
+        ok_count, _total = _grok2api_import_sso_doc(
+            grok2api_url,
+            admin_token,
+            doc,
+            pool,
+            log=_g2a_log,
+            timeout=60,
+        )
+        if ok_count > 0:
+            stats["ok"] += ok_count
+        else:
             stats["fail"] += len(batch)
-            _g2a_log(f"⚠️ 批量导入异常: {exc}")
+
+    if pool == "build" and stats["ok"] > 0:
+        _g2a_log("入库目标为 Build，触发 Web→Build 自动转换...")
+        converted, conv_failed = _grok2api_convert_web_to_build(
+            grok2api_url,
+            admin_token,
+            log=_g2a_log,
+            timeout=180,
+        )
+        if converted > 0:
+            stats["ok"] += converted
+        if conv_failed:
+            stats["fail"] += conv_failed
 
     _g2a_log(f"导入完成: 成功 {stats['ok']} | 失败 {stats['fail']} | 跳过 {stats['skipped']}")
     return stats
@@ -2528,6 +2666,26 @@ class GrokRegisterGUI:
         g_field(tk_entry(self.grok2api_frame, textvariable=self.grok2api_admin_user_var, width=20), 2, 1)
         g_label(2, 2, "管理员密码:")
         g_field(tk_entry(self.grok2api_frame, textvariable=self.grok2api_admin_password_var, width=28, show="*"), 2, 3)
+        g_label(3, 0, "入库目标:")
+        self.grok2api_pool_var = tk.StringVar(value=str(config.get("grok2api_pool", "web") or "web").strip().lower())
+        g_field(
+            tk_option_menu(
+                self.grok2api_frame,
+                self.grok2api_pool_var,
+                ["web", "build", "console"],
+                width=10,
+            ),
+            3,
+            1,
+            sticky=tk.W,
+        )
+        g_label(3, 2, "说明:")
+        g_field(
+            tk_label(self.grok2api_frame, text="web=Web池, build=自动转Build, console=Console池", bg=UI_PANEL_BG),
+            3,
+            3,
+            sticky=tk.W,
+        )
 
         self.grok2api_auto_add_var.trace_add("write", lambda *_: self._refresh_grok2api_fields())
         self._refresh_grok2api_fields()
@@ -2731,6 +2889,7 @@ class GrokRegisterGUI:
             config["grok2api_url"] = self.grok2api_url_var.get().strip()
             config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
             config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
+            config["grok2api_pool"] = str(self.grok2api_pool_var.get() or "web").strip().lower() or "web"
         except Exception:
             pass
         self.log("[*] 开始连通性检查...")
@@ -2868,6 +3027,7 @@ class GrokRegisterGUI:
         config["grok2api_url"] = self.grok2api_url_var.get().strip()
         config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
         config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
+        config["grok2api_pool"] = str(self.grok2api_pool_var.get() or "web").strip().lower() or "web"
         save_config()
 
         self.grok2api_convert_running = True
@@ -3073,6 +3233,7 @@ class GrokRegisterGUI:
         config["grok2api_url"] = self.grok2api_url_var.get().strip()
         config["grok2api_admin_user"] = self.grok2api_admin_user_var.get().strip()
         config["grok2api_admin_password"] = self.grok2api_admin_password_var.get()
+        config["grok2api_pool"] = str(self.grok2api_pool_var.get() or "web").strip().lower() or "web"
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
